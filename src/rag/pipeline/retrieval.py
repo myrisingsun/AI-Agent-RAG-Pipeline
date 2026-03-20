@@ -4,6 +4,8 @@ from src.common.logging import get_logger
 from src.rag.config import CollectionName, RAGConfig
 from src.rag.embeddings.base import EmbeddingProvider
 from src.rag.llm.client import LLMClient
+from src.rag.reranker.base import Reranker
+from src.rag.router import QueryRouter
 from src.rag.vectorstore.operations import VectorStoreOperations
 from src.schemas.api import Citation, SearchResponse
 
@@ -55,7 +57,10 @@ def _build_context(hits: list[dict]) -> tuple[str, list[Citation]]:  # type: ign
 
 
 class RetrievalService:
-    """Embed → search → build context → LLM answer with citations."""
+    """
+    Retrieval pipeline:
+    auto-route → embed → search(top-N candidates) → rerank(top-K) → LLM answer
+    """
 
     def __init__(
         self,
@@ -63,38 +68,60 @@ class RetrievalService:
         embedding_provider: EmbeddingProvider,
         vs_operations: VectorStoreOperations,
         llm_client: LLMClient,
+        reranker: Reranker,
+        router: QueryRouter,
     ) -> None:
         self._config = config
         self._embedding = embedding_provider
         self._vs = vs_operations
         self._llm = llm_client
+        self._reranker = reranker
+        self._router = router
         self._qa_prompt = _load_prompt(_QA_PROMPT_PATH, _DEFAULT_QA_PROMPT)
 
     async def search(
         self,
         query: str,
-        collection: CollectionName,
+        collection: CollectionName | None = None,
         limit: int = 5,
         session_id: str | None = None,
         filters: dict[str, str] | None = None,
     ) -> SearchResponse:
         t0 = time.perf_counter()
 
+        # 1. Auto-route if collection not specified
+        resolved_collection = collection or self._router.route(query, session_id)
+
+        # 2. Embed query
         query_vector = await self._embedding.embed_query(query)
 
+        # 3. Build payload filter
         payload_filter: dict[str, str] = {}
-        if session_id and collection == CollectionName.CURRENT_PACKAGE:
+        if session_id and resolved_collection == CollectionName.CURRENT_PACKAGE:
             payload_filter["session_id"] = session_id
         if filters:
             payload_filter.update(filters)
 
+        # 4. Fetch candidates (more than needed — reranker will trim)
+        candidate_limit = (
+            self._config.reranker_candidate_limit
+            if self._config.reranker_enabled
+            else limit
+        )
         hits = await self._vs.search(
-            collection=collection,
+            collection=resolved_collection,
             query_vector=query_vector,
-            limit=limit,
+            limit=candidate_limit,
             filter_payload=payload_filter or None,
         )
 
+        # 5. Rerank and trim to requested limit
+        if self._config.reranker_enabled and hits:
+            hits = await self._reranker.rerank(query, hits, top_k=limit)
+        else:
+            hits = hits[:limit]
+
+        # 6. Build context and call LLM
         context, citations = _build_context(hits)
         prompt = self._qa_prompt.format(context=context, query=query)
         answer = await self._llm.complete(prompt)
@@ -103,8 +130,9 @@ class RetrievalService:
         logger.info(
             "retrieval completed",
             query_len=len(query),
-            hits=len(hits),
-            collection=collection,
+            collection=resolved_collection,
+            candidates=len(hits),
+            reranked=self._config.reranker_enabled,
             latency_ms=latency_ms,
         )
 
@@ -112,6 +140,6 @@ class RetrievalService:
             answer=answer,
             query=query,
             citations=citations,
-            collection=collection,
+            collection=resolved_collection,
             latency_ms=latency_ms,
         )

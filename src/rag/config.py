@@ -83,6 +83,12 @@ class RAGConfig(BaseSettings):
     # Application
     rag_log_level: str = "INFO"
 
+    # Reranker
+    reranker_enabled: bool = True
+    reranker_model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384"
+    reranker_candidate_limit: int = 50  # candidates fetched before reranking
+    reranker_top_k: int = 5             # results returned after reranking
+
     # JWT auth (set to anything other than "dev" in production)
     jwt_secret: str = "dev"
     jwt_algorithm: str = "HS256"

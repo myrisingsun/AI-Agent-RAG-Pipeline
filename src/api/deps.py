@@ -1,10 +1,13 @@
 from fastapi import Request
 
+from src.common.storage import MinIOStorage
 from src.rag.embeddings.base import EmbeddingProvider
 from src.rag.llm.client import LLMClient
 from src.rag.pipeline.ingestion import IngestionService
 from src.rag.pipeline.retrieval import RetrievalService
 from src.rag.pipeline.validation import ValidationService
+from src.rag.reranker.base import Reranker
+from src.rag.router import QueryRouter
 from src.rag.vectorstore.client import QdrantManager
 from src.rag.vectorstore.operations import VectorStoreOperations
 
@@ -23,6 +26,18 @@ def get_vs_operations(request: Request) -> VectorStoreOperations:
 
 def get_llm_client(request: Request) -> LLMClient:
     return request.app.state.llm_client  # type: ignore[no-any-return]
+
+
+def get_reranker(request: Request) -> Reranker:
+    return request.app.state.reranker  # type: ignore[no-any-return]
+
+
+def get_router(request: Request) -> QueryRouter:
+    return request.app.state.query_router  # type: ignore[no-any-return]
+
+
+def get_storage(request: Request) -> MinIOStorage:
+    return request.app.state.storage  # type: ignore[no-any-return]
 
 
 def get_ingestion_service(request: Request) -> IngestionService:

@@ -3,16 +3,18 @@ from datetime import UTC, datetime
 
 from src.common.exceptions import ChunkingError
 from src.common.logging import get_logger
+from src.common.storage import MinIOStorage
 from src.rag.chunking.fixed_size import FixedSizeChunkingStrategy
 from src.rag.config import CollectionName, RAGConfig
 from src.rag.embeddings.base import EmbeddingProvider
+from src.rag.parsing.factory import get_parser
 from src.rag.vectorstore.operations import VectorStoreOperations
 from src.schemas.api import DocumentUploadResponse
-from src.schemas.document import DocType, ParsedDocument
+from src.schemas.document import DocType
 
 logger = get_logger(__name__)
 
-# doc_type → target collection
+# doc_type → target Qdrant collection
 _COLLECTION_MAP: dict[DocType, CollectionName] = {
     DocType.CONTRACT: CollectionName.CURRENT_PACKAGE,
     DocType.FINANCIAL_REPORT: CollectionName.CURRENT_PACKAGE,
@@ -22,32 +24,20 @@ _COLLECTION_MAP: dict[DocType, CollectionName] = {
 }
 
 
-def _extract_text(file_bytes: bytes, filename: str) -> str:
-    """
-    Extract plain text from an uploaded file.
-    MVP: .txt only. Production: use Docling for PDF/DOCX.
-    """
-    lower = filename.lower()
-    if lower.endswith(".txt"):
-        return file_bytes.decode("utf-8", errors="replace")
-    raise ChunkingError(
-        f"Unsupported file type: '{filename}'. "
-        "MVP supports .txt only. Configure Docling for PDF/DOCX in production."
-    )
-
-
 class IngestionService:
-    """Orchestrates the full ingestion pipeline: parse → chunk → embed → upsert."""
+    """Orchestrates the full ingestion pipeline: parse → store → chunk → embed → upsert."""
 
     def __init__(
         self,
         config: RAGConfig,
         embedding_provider: EmbeddingProvider,
         vs_operations: VectorStoreOperations,
+        storage: MinIOStorage,
     ) -> None:
         self._config = config
         self._embedding = embedding_provider
         self._vs = vs_operations
+        self._storage = storage
         self._chunker = FixedSizeChunkingStrategy(config)
 
     async def ingest(
@@ -58,35 +48,44 @@ class IngestionService:
         session_id: str | None = None,
     ) -> DocumentUploadResponse:
         """
-        Full ingestion pipeline.
-        Returns a DocumentUploadResponse with chunk count and target collection.
+        Full ingestion pipeline:
+        1. Parse file (TXT / PDF / DOCX)
+        2. Upload original to MinIO
+        3. Chunk → embed → upsert to Qdrant
         """
         doc_id = uuid.uuid4()
-        text = _extract_text(file_bytes, filename)
 
-        parsed = ParsedDocument(
-            id=doc_id,
-            filename=filename,
-            doc_type=doc_type,
-            content=text,
-            metadata={"session_id": session_id or ""},
-        )
+        # 1. Parse
+        parser = get_parser(filename)
+        parsed = parser.parse(file_bytes, filename, doc_type)
+        parsed.id = doc_id
 
+        # 2. Upload original to MinIO (non-fatal: log warning on failure)
+        source_path: str | None = None
+        try:
+            source_path = await self._storage.upload(str(doc_id), filename, file_bytes)
+        except Exception as exc:
+            logger.warning("MinIO upload failed, continuing without source_path", error=str(exc))
+
+        # 3. Chunk
         chunks = self._chunker.chunk_document(parsed)
         if not chunks:
             raise ChunkingError(f"No chunks produced from '{filename}'")
 
-        # Attach session_id to each chunk for current_package filtering
-        if session_id:
-            for chunk in chunks:
+        # Attach session_id and source_path to each chunk
+        for chunk in chunks:
+            if session_id:
                 chunk.metadata.session_id = session_id
+            if source_path:
+                chunk.metadata.source_path = source_path
 
-        # Embed all chunks in one batch call
+        # 4. Embed (single batch call)
         texts = [c.text for c in chunks]
         embeddings = await self._embedding.embed_texts(texts)
         for chunk, emb in zip(chunks, embeddings, strict=True):
             chunk.embedding = emb
 
+        # 5. Upsert to Qdrant
         collection = _COLLECTION_MAP.get(doc_type, CollectionName.CURRENT_PACKAGE)
         count = await self._vs.upsert_chunks(collection, chunks)
 
@@ -97,6 +96,7 @@ class IngestionService:
             doc_type=doc_type,
             collection=collection,
             chunks=count,
+            pages=parsed.pages,
         )
 
         return DocumentUploadResponse(

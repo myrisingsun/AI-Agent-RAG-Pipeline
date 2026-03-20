@@ -7,12 +7,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.middleware.logging import RequestLoggingMiddleware
 from src.api.routes import collections, documents, search, validate, websocket
 from src.common.logging import configure_logging, get_logger
+from src.common.storage import MinIOStorage
 from src.rag.config import get_config
 from src.rag.embeddings.e5_large import E5LargeEmbeddingProvider
 from src.rag.llm.client import LLMClient
 from src.rag.pipeline.ingestion import IngestionService
 from src.rag.pipeline.retrieval import RetrievalService
 from src.rag.pipeline.validation import ValidationService
+from src.rag.reranker.cross_encoder import CrossEncoderReranker
+from src.rag.router import QueryRouter
 from src.rag.vectorstore.client import QdrantManager
 from src.rag.vectorstore.operations import VectorStoreOperations
 
@@ -35,9 +38,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     vs_operations = VectorStoreOperations(qdrant_manager, config)
     llm_client = LLMClient(config)
 
+    # Reranker (optional — disable with RERANKER_ENABLED=false)
+    reranker = CrossEncoderReranker(config)
+    if config.reranker_enabled:
+        await reranker.initialize()
+    else:
+        logger.info("reranker disabled via RERANKER_ENABLED=false")
+
+    # Query router
+    query_router = QueryRouter()
+
+    # MinIO storage
+    storage = MinIOStorage(config)
+    try:
+        await storage.initialize()
+    except Exception as exc:
+        logger.warning("MinIO unavailable, uploads will skip file storage", error=str(exc))
+
     # Services
-    ingestion_service = IngestionService(config, embedding_provider, vs_operations)
-    retrieval_service = RetrievalService(config, embedding_provider, vs_operations, llm_client)
+    ingestion_service = IngestionService(config, embedding_provider, vs_operations, storage)
+    retrieval_service = RetrievalService(
+        config, embedding_provider, vs_operations, llm_client, reranker, query_router
+    )
     validation_service = ValidationService(config, embedding_provider, vs_operations, llm_client)
 
     # Attach to app state
@@ -46,12 +68,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.embedding_provider = embedding_provider
     app.state.vs_operations = vs_operations
     app.state.llm_client = llm_client
+    app.state.reranker = reranker
+    app.state.query_router = query_router
+    app.state.storage = storage
     app.state.ingestion_service = ingestion_service
     app.state.retrieval_service = retrieval_service
     app.state.validation_service = validation_service
     app.state.document_registry: dict = {}  # MVP: in-memory; production: PostgreSQL
 
-    logger.info("RAG API ready")
+    logger.info("RAG API ready", reranker=config.reranker_enabled)
     yield
 
     # Cleanup
@@ -64,14 +89,14 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="RAG Pipeline API",
         description="Credit collateral document analysis — Q&A + normative compliance",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
 
     app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173"],  # Vite dev server
+        allow_origins=["http://localhost:5173"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -82,7 +107,7 @@ def create_app() -> FastAPI:
     app.include_router(search.router, prefix=api_v1_prefix)
     app.include_router(validate.router, prefix=api_v1_prefix)
     app.include_router(collections.router, prefix=api_v1_prefix)
-    app.include_router(websocket.router)  # /ws/chat — no /api/v1 prefix
+    app.include_router(websocket.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:
