@@ -4,9 +4,16 @@ from src.common.exceptions import ChunkingError
 from src.rag.parsing.base import DocumentParser
 from src.schemas.document import DocType, ParsedDocument
 
+# Form-feed character (\x0c) separates pages in the extracted content.
+# Chunkers can use content[:offset].count('\x0c') + 1 to determine page number.
+PAGE_SEPARATOR = "\x0c"
+
 
 class PdfParser(DocumentParser):
-    """PDF parser using pypdf. Extracts text page-by-page."""
+    """
+    PDF parser using pypdf. Extracts text page-by-page.
+    Pages are joined with \\x0c (form-feed) so chunkers can track page numbers.
+    """
 
     def parse(self, file_bytes: bytes, filename: str, doc_type: DocType) -> ParsedDocument:
         try:
@@ -22,9 +29,11 @@ class PdfParser(DocumentParser):
         page_texts: list[str] = []
         for page in reader.pages:
             text = page.extract_text() or ""
-            page_texts.append(text.strip())
+            stripped = text.strip()
+            if stripped:
+                page_texts.append(stripped)
 
-        content = "\n\n".join(t for t in page_texts if t)
+        content = PAGE_SEPARATOR.join(page_texts)
         if not content:
             raise ChunkingError(f"PDF '{filename}' contains no extractable text (scanned image?).")
 

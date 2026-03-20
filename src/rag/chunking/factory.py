@@ -4,6 +4,7 @@ from src.rag.chunking.base import ChunkingStrategy
 from src.rag.chunking.fixed_size import FixedSizeChunkingStrategy
 from src.rag.chunking.hierarchical import HierarchicalChunkingStrategy
 from src.rag.chunking.semantic import SemanticChunkingStrategy
+from src.rag.chunking.table_aware import TableAwareChunkingStrategy
 from src.rag.config import RAGConfig
 from src.schemas.document import DocType
 
@@ -15,7 +16,7 @@ class ChunkingStrategyFactory:
     Mapping (per CLAUDE.md):
       normative         → hierarchical (article-aware)
       contract          → semantic (paragraph-aware)
-      financial_report  → fixed_size (table_aware TODO)
+      financial_report  → table_aware (keeps tables intact)
       template          → fixed_size
       unknown           → fixed_size
     """
@@ -25,7 +26,7 @@ class ChunkingStrategyFactory:
         self._strategies: dict[DocType, ChunkingStrategy] = {
             DocType.NORMATIVE: HierarchicalChunkingStrategy(config),
             DocType.CONTRACT: SemanticChunkingStrategy(config),
-            DocType.FINANCIAL_REPORT: _fixed,  # TODO: replace with TableAwareChunkingStrategy
+            DocType.FINANCIAL_REPORT: TableAwareChunkingStrategy(config),
             DocType.TEMPLATE: _fixed,
             DocType.UNKNOWN: _fixed,
         }

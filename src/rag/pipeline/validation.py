@@ -1,3 +1,6 @@
+import json
+import re
+
 from src.common.logging import get_logger
 from src.rag.config import CollectionName, RAGConfig
 from src.rag.embeddings.base import EmbeddingProvider
@@ -18,14 +21,15 @@ _DEFAULT_VALIDATE_PROMPT = """\
 Применимые нормативы:
 {normative_context}
 
-Выявите нарушения (критичные / предупреждения / информационные).
-Укажите конкретные статьи и пункты, которым документ не соответствует.
-Если нарушений нет — напишите "Документ соответствует нормативным требованиям."
+Верните ответ СТРОГО в формате JSON:
+{{"issues": [{{"severity": "critical|warning|info", "article": "...", "violation": "...", "recommendation": "..."}}], "summary": "..."}}
 
-Заключение:"""
+JSON:"""
 
 # Representative query used to retrieve document chunks for validation
 _VALIDATION_QUERY = "кредитное соглашение обеспечение залог условия договора"
+
+_VALID_SEVERITIES = {"critical", "warning", "info"}
 
 
 def _load_prompt(path: str, default: str) -> str:
@@ -34,6 +38,18 @@ def _load_prompt(path: str, default: str) -> str:
             return f.read()
     except FileNotFoundError:
         return default
+
+
+def _extract_json(text: str) -> str:
+    """Extract the first JSON object from LLM output (strips markdown fences etc.)."""
+    # Strip markdown code fences
+    text = re.sub(r"```(?:json)?\s*", "", text).strip()
+    # Find first `{` … last `}`
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
 
 
 class ValidationService:
@@ -59,7 +75,7 @@ class ValidationService:
     ) -> ValidateResponse:
         """
         Retrieve session documents, search relevant normative articles,
-        and call LLM to produce a compliance report.
+        and call LLM to produce a structured compliance report.
         """
         query_vector = await self._embedding.embed_query(_VALIDATION_QUERY)
 
@@ -124,8 +140,10 @@ class ValidationService:
         )
         llm_response = await self._llm.complete(prompt)
 
-        # 5. Parse issues (MVP: keyword heuristic; production: structured JSON output)
+        # 5. Parse structured issues from JSON output (with keyword fallback)
         issues = self._parse_issues(llm_response, norm_hits)
+        summary = self._extract_summary(llm_response)
+
         if any(i.severity == "critical" for i in issues):
             status = "non_compliant"
         elif any(i.severity == "warning" for i in issues):
@@ -144,7 +162,7 @@ class ValidationService:
             session_id=session_id,
             status=status,
             issues=issues,
-            summary=llm_response[:500],
+            summary=summary,
             checked_articles=checked_articles,
         )
 
@@ -153,10 +171,43 @@ class ValidationService:
         llm_response: str,
         norm_hits: list[dict],  # type: ignore[type-arg]
     ) -> list[ValidationIssue]:
-        """MVP: single issue from raw LLM text. Production: parse structured JSON."""
+        """Parse issues from structured JSON output. Falls back to keyword heuristic."""
         if not llm_response.strip():
             return []
 
+        # --- Try JSON path ---
+        try:
+            data = json.loads(_extract_json(llm_response))
+            raw_issues = data.get("issues", [])
+            if isinstance(raw_issues, list):
+                result: list[ValidationIssue] = []
+                for item in raw_issues:
+                    if not isinstance(item, dict):
+                        continue
+                    severity = str(item.get("severity", "info")).lower()
+                    if severity not in _VALID_SEVERITIES:
+                        severity = "info"
+                    article = item.get("article") or None
+                    violation = str(item.get("violation", "")).strip()
+                    recommendation = str(item.get("recommendation", "")).strip()
+                    description = violation
+                    if recommendation:
+                        description = f"{violation}\nРекомендация: {recommendation}"
+
+                    citation = self._find_citation(norm_hits, article)
+                    result.append(
+                        ValidationIssue(
+                            severity=severity,
+                            description=description,
+                            law_article=article,
+                            citation=citation,
+                        )
+                    )
+                return result
+        except (json.JSONDecodeError, KeyError, TypeError):
+            logger.debug("JSON parse failed for validation response, using heuristic fallback")
+
+        # --- Keyword heuristic fallback ---
         lower = llm_response.lower()
         if any(kw in lower for kw in ["нарушение", "не соответствует", "критично"]):
             severity = "critical"
@@ -185,3 +236,42 @@ class ValidationService:
                 citation=citation,
             )
         ]
+
+    def _extract_summary(self, llm_response: str) -> str:
+        """Extract summary field from JSON response, or use first 500 chars."""
+        try:
+            data = json.loads(_extract_json(llm_response))
+            summary = data.get("summary", "")
+            if summary:
+                return str(summary)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        return llm_response[:500]
+
+    def _find_citation(
+        self,
+        norm_hits: list[dict],  # type: ignore[type-arg]
+        article: str | None,
+    ) -> Citation | None:
+        """Find the most relevant norm_hit for the given article label."""
+        if not norm_hits:
+            return None
+        # Try to match by article label first
+        if article:
+            for hit in norm_hits:
+                hit_article = str(hit["payload"].get("law_article", ""))
+                if article.lower() in hit_article.lower() or hit_article.lower() in article.lower():
+                    return Citation(
+                        chunk_id=str(hit["id"]),
+                        text=str(hit["payload"].get("text", ""))[:300],
+                        score=round(float(hit["score"]), 4),
+                        law_article=hit_article or None,
+                    )
+        # Default to top hit
+        p = norm_hits[0]["payload"]
+        return Citation(
+            chunk_id=str(norm_hits[0]["id"]),
+            text=str(p.get("text", ""))[:300],
+            score=round(float(norm_hits[0]["score"]), 4),
+            law_article=p.get("law_article"),
+        )
