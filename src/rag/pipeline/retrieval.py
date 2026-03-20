@@ -92,8 +92,14 @@ class RetrievalService:
         # 1. Auto-route if collection not specified
         resolved_collection = collection or self._router.route(query, session_id)
 
-        # 2. Embed query
+        # 2. Embed query (dense + sparse for hybrid)
         query_vector = await self._embedding.embed_query(query)
+        sparse_query: dict[int, float] | None = None
+        if self._config.hybrid_search_enabled:
+            from src.rag.vectorstore.sparse import compute_sparse_vector
+            tokenizer = getattr(self._embedding, "_tokenizer", None)
+            if tokenizer is not None:
+                sparse_query = compute_sparse_vector(query, tokenizer)
 
         # 3. Build payload filter
         payload_filter: dict[str, str] = {}
@@ -113,6 +119,7 @@ class RetrievalService:
             query_vector=query_vector,
             limit=candidate_limit,
             filter_payload=payload_filter or None,
+            sparse_vector=sparse_query,
         )
 
         # 5. Rerank and trim to requested limit

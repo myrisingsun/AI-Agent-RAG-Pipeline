@@ -1,6 +1,10 @@
-from fastapi import Request
+from collections.abc import AsyncIterator
+
+from fastapi import Depends, HTTPException, Request
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.common.storage import MinIOStorage
+from src.rag.repositories.document_repository import DocumentRepository
 from src.rag.embeddings.base import EmbeddingProvider
 from src.rag.llm.client import LLMClient
 from src.rag.pipeline.ingestion import IngestionService
@@ -52,5 +56,15 @@ def get_validation_service(request: Request) -> ValidationService:
     return request.app.state.validation_service  # type: ignore[no-any-return]
 
 
-def get_document_registry(request: Request) -> dict:  # type: ignore[type-arg]
-    return request.app.state.document_registry  # type: ignore[no-any-return]
+async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
+    factory = request.app.state.async_session_factory
+    if factory is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    async with factory() as session:
+        yield session
+
+
+async def get_document_repository(
+    session: AsyncSession = Depends(get_db_session),
+) -> DocumentRepository:
+    return DocumentRepository(session)

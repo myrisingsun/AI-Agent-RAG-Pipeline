@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.middleware.logging import RequestLoggingMiddleware
+from src.common.database import build_engine, build_session_factory, init_tables
 from src.api.routes import collections, documents, search, validate, websocket
 from src.common.logging import configure_logging, get_logger
 from src.common.storage import MinIOStorage
@@ -74,7 +75,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.ingestion_service = ingestion_service
     app.state.retrieval_service = retrieval_service
     app.state.validation_service = validation_service
-    app.state.document_registry: dict = {}  # MVP: in-memory; production: PostgreSQL
+    # PostgreSQL
+    db_engine = build_engine(config)
+    try:
+        await init_tables(db_engine)
+        app.state.async_session_factory = build_session_factory(db_engine)
+        app.state.db_engine = db_engine
+    except Exception as exc:
+        logger.warning("PostgreSQL unavailable, document registry disabled", error=str(exc))
+        app.state.async_session_factory = None
+        app.state.db_engine = None
 
     logger.info("RAG API ready", reranker=config.reranker_enabled)
     yield
@@ -82,6 +92,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Cleanup
     await qdrant_manager.close()
     await llm_client.close()
+    if app.state.db_engine:
+        await app.state.db_engine.dispose()
     logger.info("RAG API shutdown complete")
 
 

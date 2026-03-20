@@ -83,6 +83,9 @@ class RAGConfig(BaseSettings):
     # Application
     rag_log_level: str = "INFO"
 
+    # Hybrid search
+    hybrid_search_enabled: bool = True
+
     # Reranker
     reranker_enabled: bool = True
     reranker_model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"

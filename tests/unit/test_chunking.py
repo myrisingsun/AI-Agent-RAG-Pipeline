@@ -117,3 +117,108 @@ def test_overlap_produces_shared_tokens(config: RAGConfig) -> None:
     assert chunks[0].token_count <= config.chunking_chunk_size
     # Second chunk's token count should be > 0
     assert chunks[1].token_count > 0
+
+
+# ─── SemanticChunkingStrategy ─────────────────────────────────────────────────
+
+from src.rag.chunking.semantic import SemanticChunkingStrategy
+from src.rag.chunking.hierarchical import HierarchicalChunkingStrategy
+from src.rag.chunking.factory import ChunkingStrategyFactory
+
+
+@pytest.mark.unit
+def test_semantic_empty_returns_empty(config: RAGConfig) -> None:
+    strategy = SemanticChunkingStrategy(config)
+    doc = _make_doc("")
+    assert strategy.chunk_document(doc) == []
+
+
+@pytest.mark.unit
+def test_semantic_single_paragraph(config: RAGConfig) -> None:
+    strategy = SemanticChunkingStrategy(config)
+    doc = _make_doc("Залогодатель обязуется. Статья 334 ГК РФ применяется.")
+    chunks = strategy.chunk_document(doc)
+    assert len(chunks) >= 1
+    assert chunks[0].metadata.section == "1"
+
+
+@pytest.mark.unit
+def test_semantic_multiple_paragraphs(config: RAGConfig) -> None:
+    strategy = SemanticChunkingStrategy(config)
+    content = "\n\n".join([f"Параграф {i}. " + "Текст. " * 20 for i in range(5)])
+    doc = _make_doc(content)
+    chunks = strategy.chunk_document(doc)
+    assert len(chunks) >= 1
+    for i, chunk in enumerate(chunks):
+        assert chunk.metadata.chunk_index == i
+
+
+@pytest.mark.unit
+def test_semantic_section_metadata_populated(config: RAGConfig) -> None:
+    strategy = SemanticChunkingStrategy(config)
+    doc = _make_doc("Первый раздел.\n\nВторой раздел.")
+    chunks = strategy.chunk_document(doc)
+    assert all(c.metadata.section is not None for c in chunks)
+
+
+# ─── HierarchicalChunkingStrategy ─────────────────────────────────────────────
+
+@pytest.mark.unit
+def test_hierarchical_empty_returns_empty(config: RAGConfig) -> None:
+    strategy = HierarchicalChunkingStrategy(config)
+    doc = _make_doc("")
+    assert strategy.chunk_document(doc) == []
+
+
+@pytest.mark.unit
+def test_hierarchical_extracts_articles(config: RAGConfig) -> None:
+    strategy = HierarchicalChunkingStrategy(config)
+    content = (
+        "Преамбула документа.\n\n"
+        "Статья 1. Общие положения.\nЗалог регулируется ГК РФ.\n\n"
+        "Статья 2. Предмет залога.\nПредметом залога является имущество.\n\n"
+        "Статья 3. Права сторон.\nЗалогодержатель вправе требовать исполнения."
+    )
+    doc = _make_doc(content, doc_type=DocType.NORMATIVE)
+    chunks = strategy.chunk_document(doc)
+    articles = [c.metadata.law_article for c in chunks if c.metadata.law_article]
+    assert len(articles) == 3
+    assert any("Статья 1" in a for a in articles)
+    assert any("Статья 2" in a for a in articles)
+
+
+@pytest.mark.unit
+def test_hierarchical_fallback_to_paragraphs_when_no_articles(config: RAGConfig) -> None:
+    strategy = HierarchicalChunkingStrategy(config)
+    doc = _make_doc("Просто текст без статей.\n\nЕщё один параграф.")
+    chunks = strategy.chunk_document(doc)
+    assert len(chunks) >= 1
+
+
+@pytest.mark.unit
+def test_hierarchical_law_article_metadata(config: RAGConfig) -> None:
+    strategy = HierarchicalChunkingStrategy(config)
+    content = "Статья 334. Понятие залога.\nЗалог обеспечивает обязательство."
+    doc = _make_doc(content, doc_type=DocType.NORMATIVE)
+    chunks = strategy.chunk_document(doc)
+    assert any(c.metadata.law_article is not None for c in chunks)
+
+
+# ─── ChunkingStrategyFactory ──────────────────────────────────────────────────
+
+@pytest.mark.unit
+def test_factory_normative_returns_hierarchical(config: RAGConfig) -> None:
+    factory = ChunkingStrategyFactory(config)
+    assert isinstance(factory.get(DocType.NORMATIVE), HierarchicalChunkingStrategy)
+
+
+@pytest.mark.unit
+def test_factory_contract_returns_semantic(config: RAGConfig) -> None:
+    factory = ChunkingStrategyFactory(config)
+    assert isinstance(factory.get(DocType.CONTRACT), SemanticChunkingStrategy)
+
+
+@pytest.mark.unit
+def test_factory_unknown_returns_fixed_size(config: RAGConfig) -> None:
+    factory = ChunkingStrategyFactory(config)
+    assert isinstance(factory.get(DocType.UNKNOWN), FixedSizeChunkingStrategy)

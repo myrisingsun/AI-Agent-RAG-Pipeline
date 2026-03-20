@@ -3,10 +3,11 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 
-from src.api.deps import get_document_registry, get_ingestion_service
+from src.api.deps import get_document_repository, get_ingestion_service
 from src.api.middleware.auth import require_auth
 from src.common.exceptions import ChunkingError
 from src.rag.pipeline.ingestion import IngestionService
+from src.rag.repositories.document_repository import DocumentRepository
 from src.schemas.api import DocumentResponse, DocumentUploadResponse
 from src.schemas.document import DocType
 
@@ -21,13 +22,10 @@ async def upload_document(
     doc_type: Annotated[DocType, Form()],
     session_id: Annotated[str | None, Form()] = None,
     ingestion: IngestionService = Depends(get_ingestion_service),
-    registry: dict[str, Any] = Depends(get_document_registry),
+    repo: DocumentRepository = Depends(get_document_repository),
     _user: dict[str, Any] = Depends(require_auth),
 ) -> DocumentUploadResponse:
-    """
-    Upload a document and index it into the appropriate Qdrant collection.
-    Returns document id, chunk count, and target collection.
-    """
+    """Upload a document and index it into the appropriate Qdrant collection."""
     if file.filename is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Filename is required")
 
@@ -50,18 +48,26 @@ async def upload_document(
     except ChunkingError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    registry[str(result.id)] = result.model_dump()
+    await repo.save(result, session_id=session_id)
     return result
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)
 async def get_document(
     document_id: uuid.UUID,
-    registry: dict[str, Any] = Depends(get_document_registry),
+    repo: DocumentRepository = Depends(get_document_repository),
     _user: dict[str, Any] = Depends(require_auth),
 ) -> DocumentResponse:
     """Return document metadata by id."""
-    doc = registry.get(str(document_id))
-    if doc is None:
+    record = await repo.get_by_id(document_id)
+    if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-    return DocumentResponse(**doc)
+    return DocumentResponse(
+        id=record.id,
+        filename=record.filename,
+        doc_type=record.doc_type,
+        collection=record.collection,
+        chunk_count=record.chunk_count,
+        created_at=record.created_at,
+        metadata={},
+    )
