@@ -21,8 +21,7 @@ _DEFAULT_VALIDATE_PROMPT = """\
 Применимые нормативы:
 {normative_context}
 
-Верните ответ СТРОГО в формате JSON:
-{{"issues": [{{"severity": "critical|warning|info", "article": "...", "violation": "...", "recommendation": "..."}}], "summary": "..."}}
+Верните ответ в формате JSON: issues (массив с полями severity/article/violation/recommendation) и summary.
 
 JSON:"""
 
@@ -134,9 +133,10 @@ class ValidationService:
         ]
 
         # 4. Call LLM
-        prompt = self._validate_prompt.format(
-            document_context=doc_context,
-            normative_context=norm_context,
+        prompt = (
+            self._validate_prompt
+            .replace("{document_context}", doc_context)
+            .replace("{normative_context}", norm_context)
         )
         llm_response = await self._llm.complete(prompt)
 
